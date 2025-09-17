@@ -109,3 +109,138 @@ class PJASNode:
             
         except Exception as e:
             return {"success": False, "error": str(e)}
+        
+    def register_with_coordinator(self):
+        """Register this node with the coordinator"""
+        stats = self.get_storage_stats()
+        
+        registration_data = {
+            "node_id": self.node_id,
+            "address": f"http://localhost:{self.port}",  # ------------------------------------------------------------------
+            "storage_stats": stats,
+            "status": "online",
+            "version": "1.0.0"
+        }
+        
+        try:
+            response = requests.post(
+                f"{self.coordinator_url}/nodes/register",
+                json=registration_data,
+                timeout=10
+            )
+            return response.json()
+        except Exception as e:
+            print(f"Failed to register with coordinator: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def send_heartbeat(self):
+        """Send periodic heartbeat to coordinator"""
+        while True:
+            try:
+                stats = self.get_storage_stats()
+                heartbeat_data = {
+                    "node_id": self.node_id,
+                    "storage_stats": stats,
+                    "timestamp": time.time()
+                }
+                
+                requests.post(
+                    f"{self.coordinator_url}/nodes/heartbeat",
+                    json=heartbeat_data,
+                    timeout=5
+                )
+                print(f"Heartbeat sent - {stats['usage_percent']:.1f}% used")
+                
+            except Exception as e:
+                print(f"Heartbeat failed: {e}")
+                
+            time.sleep(30)  
+    def start_server(self):
+        """Start the node HTTP server"""
+        handler = NodeRequestHandler
+        handler.node = self
+        
+        server = HTTPServer(('localhost', self.port), handler)
+        print(f"PJAS Node {self.node_id} starting on port {self.port}")
+        print(f"Storage: {self.storage_path}")
+        
+        # Start heartbeat thread
+        heartbeat_thread = threading.Thread(target=self.send_heartbeat, daemon=True)
+        heartbeat_thread.start()
+        
+        # Register with coordinator
+        self.register_with_coordinator()
+        
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down PJAS Node...")
+            server.shutdown()
+
+
+class NodeRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        """Handle GET requests"""
+        path = urlparse(self.path).path
+        query = parse_qs(urlparse(self.path).query)
+        
+        if path == '/status':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            stats = self.node.get_storage_stats()
+            response = {
+                "node_id": self.node.node_id,
+                "status": "online",
+                "storage": stats
+            }
+            self.wfile.write(json.dumps(response, indent=2).encode())
+            
+        elif path == '/chunk':
+            chunk_id = query.get('id', [None])[0]
+            if not chunk_id:
+                self.send_error(400, "Missing chunk ID")
+                return
+                
+            result = self.node.retrieve_chunk(chunk_id)
+            
+            if result["success"]:
+                self.send_response(200)
+                self.send_header('Content-type', 'application/octet-stream')
+                self.send_header('Content-Length', str(len(result["data"])))
+                self.end_headers()
+                self.wfile.write(result["data"])
+            else:
+                self.send_error(404, result["error"])
+        else:
+            self.send_error(404, "Not found")
+    
+    def do_POST(self):
+        """Handle POST requests"""
+        path = urlparse(self.path).path
+        
+        if path == '/chunk':
+            content_length = int(self.headers.get('Content-Length', 0))
+            
+            metadata_length = int(self.headers.get('X-Metadata-Length', 0))
+            metadata_json = self.rfile.read(metadata_length).decode()
+            metadata = json.loads(metadata_json)
+            
+            chunk_data = self.rfile.read(content_length - metadata_length)
+            result = self.node.store_chunk(
+                metadata["chunk_id"],
+                chunk_data,
+                metadata
+            )
+            
+            self.send_response(200 if result["success"] else 500)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        else:
+            self.send_error(404, "Not found")
+    
+    def log_message(self, format, *args):
+        """Suppress default logging"""
+        pass
