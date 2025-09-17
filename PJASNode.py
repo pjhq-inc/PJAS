@@ -3,7 +3,9 @@ import json
 import time
 import hashlib
 import requests
-import shutil
+import sys
+import uuid
+
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -244,3 +246,26 @@ class NodeRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         """Suppress default logging"""
         pass
+
+def main():
+    
+    if len(sys.argv) < 2:
+        print("Usage: python pjas_node.py <storage_directory> [allocated_gb]")
+        print("Example: python pjas_node.py ./pjas_storage 67")
+        sys.exit(1)
+    
+    storage_dir = sys.argv[1]
+    allocated_gb = int(sys.argv[2]) if len(sys.argv) > 2 else 100
+    
+    node_id = f"pjas-{uuid.uuid4().hex[:8]}"
+    
+    print(f"Starting PJAS Node: {node_id}")
+    print(f"Allocated Storage: {allocated_gb} GB")
+    print(f"Storage Directory: {storage_dir}")
+    
+    node = PJASNode(node_id, storage_dir, allocated_gb)
+    node.start_server()
+
+
+if __name__ == "__main__":
+    main()
