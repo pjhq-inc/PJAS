@@ -11,7 +11,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 class PJASNode:
-    def __init__(self, node_id, storage_path, allocated_gb=100, coordinator_url="https://pjhq.dev/api"):
+    def __init__(self, node_id, storage_path, allocated_gb=100, coordinator_url="https://pjas-production.up.railway.app/api"):
         self.node_id = node_id
         self.storage_path = os.path.abspath(storage_path)
         self.allocated_bytes = allocated_gb * 1024 * 1024 * 1024 
