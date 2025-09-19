@@ -5,18 +5,35 @@ import hashlib
 import requests
 import sys
 import uuid
-
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+def load_config():
+    config_path = os.path.join(os.path.dirname(__file__), 'pjas_config.json')
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    else:
+        default_config = {
+            "ngrok_url": "http://localhost:8420",
+            "coordinator_url": "https://pjas-production.up.railway.app/api", # this will literally not work btw i just put it here for testing lol
+            "port": 8420
+        }
+        with open(config_path, 'w') as f:
+            json.dump(default_config, f, indent=2)
+        return default_config
+
+CONFIG = load_config()
+
 class PJASNode:
-    def __init__(self, node_id, storage_path, allocated_gb=100, coordinator_url="https://pjas-production.up.railway.app/api"):
+    def __init__(self, node_id, storage_path, allocated_gb=100):
         self.node_id = node_id
         self.storage_path = os.path.abspath(storage_path)
         self.allocated_bytes = allocated_gb * 1024 * 1024 * 1024 
-        self.coordinator_url = coordinator_url
-        self.port = 8420  # pjas port (apparently needs to be 8420 for something)
+        self.coordinator_url = CONFIG['coordinator_url']  
+        self.port = CONFIG['port']  
+        self.ngrok_url = CONFIG['ngrok_url'] 
         self.chunks_dir = os.path.join(self.storage_path, "chunks")
         self.metadata_file = os.path.join(self.storage_path, "node_metadata.json")
         
@@ -118,11 +135,11 @@ class PJASNode:
         
         registration_data = {
             "node_id": self.node_id,
-            "address": f"http://localhost:{self.port}",  # ------------------------------------------------------------------
+            "address": self.ngrok_url,  
             "storage_stats": stats,
             "status": "online",
             "version": "1.0.0"
-        }
+    }
         
         try:
             response = requests.post(
@@ -166,11 +183,9 @@ class PJASNode:
         print(f"PJAS Node {self.node_id} starting on port {self.port}")
         print(f"Storage: {self.storage_path}")
         
-        # Start heartbeat thread
         heartbeat_thread = threading.Thread(target=self.send_heartbeat, daemon=True)
         heartbeat_thread.start()
         
-        # Register with coordinator
         self.register_with_coordinator()
         
         try:

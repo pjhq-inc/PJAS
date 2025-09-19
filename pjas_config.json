@@ -1,0 +1,5 @@
+{
+  "ngrok_url": "https://5a99a703d2c1.ngrok-free.app",
+  "coordinator_url": "https://pjas-production.up.railway.app/api",
+  "port": 8420
+}
