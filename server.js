@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
+const fetch = require('node-fetch');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -19,18 +20,14 @@ const upload = multer({
 
 const nodes = new Map();
 const files = new Map();
-const chunks = new Map();
+const chunks = new Map(); 
 const logs = [];
 
 function logActivity(level, message) {
   const timestamp = new Date().toISOString().replace('T', ' ').substr(0, 19);
   const logEntry = { timestamp, level, message };
   logs.push(logEntry);
-  
-  if (logs.length > 100) {
-    logs.shift();
-  }
-  
+  if (logs.length > 100) logs.shift();
   console.log(`[${level}] ${message}`);
 }
 
@@ -46,7 +43,7 @@ function generateId() {
   return uuidv4().replace(/-/g, '').substr(0, 16);
 }
 
-
+// Routes (same as before until file upload)...
 app.get('/', (req, res) => {
   res.json({ 
     status: 'PJAS Coordinator Online',
@@ -224,7 +221,7 @@ app.get('/api/files', (req, res) => {
   }
 });
 
-app.post('/api/files/upload', upload.single('file'), (req, res) => {
+app.post('/api/files/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ 
@@ -243,13 +240,13 @@ app.post('/api/files/upload', upload.single('file'), (req, res) => {
       status: 'processing'
     };
     
-    const chunksInfo = planChunkDistribution(fileMetadata, req.file.buffer);
+    const chunksInfo = await distributeFileToNodes(fileMetadata, req.file.buffer);
     
     fileMetadata.chunks = chunksInfo;
     fileMetadata.status = 'completed';
     files.set(fileId, fileMetadata);
     
-    logActivity('INFO', `File uploaded: ${req.file.originalname} (${formatBytes(req.file.size)})`);
+    logActivity('INFO', `File uploaded: ${req.file.originalname} (${formatBytes(req.file.size)}) - ${chunksInfo.length} chunks`);
     
     res.json({
       success: true,
@@ -266,7 +263,7 @@ app.post('/api/files/upload', upload.single('file'), (req, res) => {
     });
   }
 });
-// - - - -
+
 app.get('/api/files/download/:file_id', async (req, res) => {
   try {
     const fileId = req.params.file_id;
@@ -282,7 +279,7 @@ app.get('/api/files/download/:file_id', async (req, res) => {
     logActivity('INFO', `Download requested: ${fileMetadata.filename}`);
     
     try {
-      const fileBuffer = await reassembleFile(fileId, fileMetadata);
+      const fileBuffer = await retrieveFileFromNodes(fileId, fileMetadata);
       
       res.setHeader('Content-Disposition', `attachment; filename="${fileMetadata.filename}"`);
       res.setHeader('Content-Type', fileMetadata.mimetype || 'application/octet-stream');
@@ -296,7 +293,7 @@ app.get('/api/files/download/:file_id', async (req, res) => {
       logActivity('ERROR', `Download failed: ${fileMetadata.filename} - ${downloadError.message}`);
       res.status(500).json({
         success: false,
-        error: 'Failed to retrieve file'
+        error: 'Failed to retrieve file: ' + downloadError.message
       });
     }
     
@@ -309,37 +306,131 @@ app.get('/api/files/download/:file_id', async (req, res) => {
   }
 });
 
-function planChunkDistribution(fileMetadata, fileBuffer) {
-  const chunkSize = 10 * 1024 * 1024; // 10MB chunks
+async function distributeFileToNodes(fileMetadata, fileBuffer) {
+  const chunkSize = 10 * 1024 * 1024; 
   const numChunks = Math.ceil(fileMetadata.size / chunkSize);
   const onlineNodes = Array.from(nodes.values()).filter(n => n.status === 'online');
   const chunksInfo = [];
+  
+  if (onlineNodes.length === 0) {
+    logActivity('WARN', 'No online nodes available for storage');
+  }
   
   for (let i = 0; i < numChunks; i++) {
     const chunkId = generateId();
     const startByte = i * chunkSize;
     const endByte = Math.min(startByte + chunkSize, fileMetadata.size);
     const chunkData = fileBuffer.slice(startByte, endByte);
+    
     const selectedNodes = selectNodesForChunk(onlineNodes, 3);
+    const storedOnNodes = [];
+    
+    for (const node of selectedNodes) {
+      try {
+        const success = await sendChunkToNode(node, chunkId, chunkData, fileMetadata);
+        if (success) {
+          storedOnNodes.push(node.node_id);
+          logActivity('INFO', `Chunk ${chunkId} stored on node ${node.node_id}`);
+        }
+      } catch (error) {
+        logActivity('ERROR', `Failed to store chunk ${chunkId} on node ${node.node_id}: ${error.message}`);
+      }
+    }
     
     chunksInfo.push({
       chunk_id: chunkId,
       chunk_index: i,
       size: chunkData.length,
-      nodes: selectedNodes.map(n => n.node_id),
-      status: 'stored'
+      nodes: storedOnNodes,
+      status: storedOnNodes.length > 0 ? 'stored' : 'failed'
     });
     
     chunks.set(chunkId, {
       file_id: fileMetadata.file_id,
       chunk_index: i,
       size: chunkData.length,
-      nodes: selectedNodes.map(n => n.node_id),
-      data: chunkData
+      nodes: storedOnNodes
     });
   }
   
   return chunksInfo;
+}
+
+async function sendChunkToNode(node, chunkId, chunkData, fileMetadata) {
+  try {
+    const metadata = JSON.stringify({
+      chunk_id: chunkId,
+      file_id: fileMetadata.file_id,
+      filename: fileMetadata.filename,
+      chunk_size: chunkData.length
+    });
+    
+    const metadataBuffer = Buffer.from(metadata);
+    const fullPayload = Buffer.concat([metadataBuffer, chunkData]);
+    
+    const response = await fetch(`${node.address}/chunk`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'X-Metadata-Length': metadataBuffer.length.toString()
+      },
+      body: fullPayload,
+      timeout: 30000 
+    });
+    
+    const result = await response.json();
+    return result.success;
+    
+  } catch (error) {
+    logActivity('ERROR', `Error sending chunk to ${node.node_id}: ${error.message}`);
+    return false;
+  }
+}
+
+async function retrieveFileFromNodes(fileId, fileMetadata) {
+  const chunksInfo = fileMetadata.chunks || [];
+  const chunkBuffers = [];
+  
+  const sortedChunks = chunksInfo.sort((a, b) => a.chunk_index - b.chunk_index);
+  
+  for (const chunkInfo of sortedChunks) {
+    const chunkData = await retrieveChunkFromNodes(chunkInfo.chunk_id, chunkInfo.nodes);
+    
+    if (!chunkData) {
+      throw new Error(`Failed to retrieve chunk ${chunkInfo.chunk_id} from any node`);
+    }
+    
+    chunkBuffers.push(chunkData);
+  }
+  
+  return Buffer.concat(chunkBuffers);
+}
+
+async function retrieveChunkFromNodes(chunkId, nodeIds) {
+  for (const nodeId of nodeIds) {
+    const node = nodes.get(nodeId);
+    if (!node || node.status !== 'online') {
+      continue;
+    }
+    
+    try {
+      const response = await fetch(`${node.address}/chunk?id=${chunkId}`, {
+        timeout: 10000
+      });
+      
+      if (response.ok) {
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        logActivity('INFO', `Retrieved chunk ${chunkId} from node ${nodeId}`);
+        return buffer;
+      }
+    } catch (error) {
+      logActivity('WARN', `Failed to retrieve chunk ${chunkId} from node ${nodeId}: ${error.message}`);
+      continue;
+    }
+  }
+  
+  return null;
 }
 
 function selectNodesForChunk(availableNodes, count) {
@@ -348,25 +439,6 @@ function selectNodesForChunk(availableNodes, count) {
   return availableNodes
     .sort((a, b) => (b.storage_stats?.free_bytes || 0) - (a.storage_stats?.free_bytes || 0))
     .slice(0, Math.min(count, availableNodes.length));
-}
-
-async function reassembleFile(fileId, fileMetadata) {
-  const chunksInfo = fileMetadata.chunks || [];
-  const chunkBuffers = [];
-  
-  const sortedChunks = chunksInfo.sort((a, b) => a.chunk_index - b.chunk_index);
-  
-  for (const chunkInfo of sortedChunks) {
-    const chunkData = chunks.get(chunkInfo.chunk_id);
-    
-    if (!chunkData || !chunkData.data) {
-      throw new Error(`Missing chunk ${chunkInfo.chunk_id}`);
-    }
-    
-    chunkBuffers.push(chunkData.data);
-  }
-  
-  return Buffer.concat(chunkBuffers);
 }
 
 app.listen(port, () => {
